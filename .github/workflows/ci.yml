@@ -2,7 +2,7 @@ name: Control-plane CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "ci-check/**"]
   pull_request:
   schedule:
     - cron: "29 6 * * *"
