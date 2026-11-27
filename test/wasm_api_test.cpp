@@ -1,7 +1,9 @@
 #include "gr4cp/api/http_server.hpp"
 #include "gr4cp/api/wasm_api.hpp"
 
+#include <optional>
 #include <regex>
+#include <string>
 #include <string_view>
 #include <thread>
 
@@ -24,6 +26,33 @@ public:
 class EmptySchedulerCatalogProvider final : public gr4cp::catalog::SchedulerCatalogProvider {
 public:
     std::vector<gr4cp::domain::SchedulerDescriptor> list() const override { return {}; }
+};
+
+// A runtime whose every start stops on a setting.
+class SettingRefusingRuntimeManager final : public gr4cp::runtime::RuntimeManager {
+public:
+    void prepare(const gr4cp::domain::Session&) override {}
+    void start(const gr4cp::domain::Session&) override {
+        throw gr4cp::runtime::StartSettingsError("source0.gain: out of range [0, 1]: 2");
+    }
+    std::optional<std::string> stop(const gr4cp::domain::Session&) override { return std::nullopt; }
+    void destroy(const gr4cp::domain::Session&) override {}
+    std::optional<gr4cp::domain::StreamRuntimePlan> active_stream_plan(const gr4cp::domain::Session&) override {
+        return std::nullopt;
+    }
+    gr4cp::runtime::HttpStreamResponse fetch_http_stream(const gr4cp::domain::Session&, const std::string&) override {
+        return {};
+    }
+    gr4cp::runtime::WebSocketStreamRoute resolve_websocket_stream(const gr4cp::domain::Session&,
+                                                                  const std::string&) override {
+        throw gr4cp::runtime::SessionNotRunningError("no run");
+    }
+    void set_block_settings(const gr4cp::domain::Session&,
+                            const std::string&,
+                            const gr::property_map&,
+                            gr4cp::runtime::BlockSettingsMode) override {}
+    gr::property_map get_block_settings(const gr4cp::domain::Session&, const std::string&) override { return {}; }
+    gr4cp::runtime::RunObservation observe(const gr4cp::domain::Session&) override { return {}; }
 };
 
 class WasmApiTest : public ::testing::Test {
@@ -115,6 +144,34 @@ TEST_F(WasmApiTest, HealthAndEverySessionResponseShareHttpIdentityAndSerializati
         }
         previous_execution = execution_id;
         expect_matching_session();
+    }
+}
+
+// A start or a restart that stops on a setting is answered 409 with the code `settings_refused` and the key, and the
+// session reads that error.
+TEST_F(WasmApiTest, StartThatStopsOnASettingAnswers409WithTheKey) {
+    SettingRefusingRuntimeManager refusing;
+    gr4cp::app::SessionService refusing_sessions{repository, refusing};
+    gr4cp::app::BlockSettingsService refusing_settings{refusing_sessions, refusing};
+    gr4cp::api::WasmApi refusing_api{refusing_sessions, streams, block_catalog, scheduler_catalog, refusing_settings};
+
+    const auto created = refusing_api.dispatch("POST", "/sessions", R"({"name":"refused","grc":"graph"})");
+    ASSERT_EQ(created.status, 201) << created.body;
+    const auto path = "/sessions/" + Json::parse(created.body).at("id").get<std::string>();
+
+    for (const auto* action : {"start", "restart"}) {
+        const auto response = refusing_api.dispatch("POST", path + "/" + action, "");
+        EXPECT_EQ(response.status, 409) << action << ": " << response.body;
+        const auto error = Json::parse(response.body).at("error");
+        EXPECT_EQ(error.at("code"), "settings_refused") << response.body;
+        const auto message = error.at("message").get<std::string>();
+        EXPECT_NE(message.find("source0.gain: out of range [0, 1]: 2"), std::string::npos) << response.body;
+
+        const auto read = refusing_api.dispatch("GET", path, "");
+        ASSERT_EQ(read.status, 200) << read.body;
+        const auto session = Json::parse(read.body);
+        EXPECT_EQ(session.at("state"), "error") << read.body;
+        EXPECT_EQ(session.at("last_error"), message) << read.body;
     }
 }
 

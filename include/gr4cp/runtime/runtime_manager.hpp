@@ -27,6 +27,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A start stopped on the graph's settings: core refused them as it built the graph or as the graph started, or a
+// block failed a key at its start. No run is left.
+class StartSettingsError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 // The changes in a session's run since the previous observe() call.
 struct RunObservation {
     std::optional<std::string> last_error;  // the text of the last error a block reported

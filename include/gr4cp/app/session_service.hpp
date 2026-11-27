@@ -35,6 +35,13 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A start or a restart stopped on the graph's settings: core refused them as it built the graph or as the graph
+// started, or a block failed a key at its start.
+class StartSettingsError : public RuntimeError {
+public:
+    using RuntimeError::RuntimeError;
+};
+
 class SessionService {
 public:
     SessionService(storage::SessionRepository& repository, runtime::RuntimeManager& runtime_manager);
@@ -76,7 +83,12 @@ private:
     void store_session_locked(const domain::Session& session, InternalLifecyclePhase phase);
     void erase_phase_locked(const std::string& id);
     // Records the session in error with `message` in `phase`, with `reason` as its completion reason: an error for a
-    // stop or a removal that failed, none for a start or a restart that failed. Throws RuntimeError with `message`.
+    // stop or a removal that failed, none for a start or a restart that failed.
+    void record_failure(domain::Session session,
+                        const std::string& message,
+                        std::optional<domain::CompletionReason> reason,
+                        InternalLifecyclePhase phase = InternalLifecyclePhase::Failed);
+    // Records the failure as record_failure does, then throws RuntimeError with `message`.
     [[noreturn]] void record_runtime_failure(domain::Session session,
                                              const std::string& message,
                                              std::optional<domain::CompletionReason> reason,

@@ -173,9 +173,10 @@ TEST(Gr4BlockCatalogProviderTest, BlockDetailsIncludeBuiltinParametersAndExtende
     EXPECT_FALSE(amplitude->allow_custom_value.has_value());
 
     EXPECT_EQ(signal_type->type, "string");
+    EXPECT_EQ(signal_type->summary, "signal type");
     EXPECT_EQ(signal_type->enum_choices,
               std::optional<std::vector<std::string>>(
-                  std::vector<std::string>{"Const", "Sin", "Cos", "Square", "Saw", "Triangle", "FastSin", "FastCos", "UniformNoise", "TriangularNoise", "GaussianNoise"}));
+                  std::vector<std::string>{"constant", "sin", "cos", "square", "saw", "triangle", "fast_sin", "fast_cos", "uniform_noise", "triangular_noise", "gaussian_noise"}));
     EXPECT_TRUE(signal_type->enum_type.has_value());
     EXPECT_FALSE(signal_type->enum_type->empty());
 }

@@ -11,9 +11,12 @@
 #include <complex>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -24,18 +27,23 @@ namespace gr4cp::test {
 // Produces `n_samples` zeros and ends.
 struct FiniteSource : gr::Block<FiniteSource> {
     gr::PortOut<float> out;
-    gr::Size_t n_samples = 4096U;
 
-    GR_MAKE_REFLECTABLE(FiniteSource, out, n_samples);
+    struct Settings {
+        gr::Size_t n_samples = 4096U;
+
+        GR_MAKE_REFLECTABLE(Settings, n_samples);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(FiniteSource, out, settings);
 
     explicit FiniteSource(gr::property_map init = {}) : gr::Block<FiniteSource>(std::move(init)) {}
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        const auto n = std::min<std::size_t>(outSpan.size(), n_samples - produced_);
+        const auto n = std::min<std::size_t>(outSpan.size(), settings.n_samples - produced_);
         std::fill_n(outSpan.begin(), n, 0.0F);
         outSpan.publish(n);
         produced_ += static_cast<gr::Size_t>(n);
-        return produced_ >= n_samples ? gr::work::Status::DONE : gr::work::Status::OK;
+        return produced_ >= settings.n_samples ? gr::work::Status::DONE : gr::work::Status::OK;
     }
 
 private:
@@ -46,24 +54,34 @@ private:
 // their 64-bit types.
 struct ExtremeValueSource : gr::Block<ExtremeValueSource> {
     gr::PortOut<float> out;
-    gr::Size_t n_samples = 64U;
-    std::int64_t lowest = 0;
-    std::uint64_t highest = 0U;
 
-    GR_MAKE_REFLECTABLE(ExtremeValueSource, out, n_samples, lowest, highest);
+    struct Settings {
+        gr::Size_t n_samples = 64U;
+
+        GR_MAKE_REFLECTABLE(Settings, n_samples);
+    } settings;
+
+    struct Status {
+        std::int64_t lowest = 0;
+        std::uint64_t highest = 0U;
+
+        GR_MAKE_REFLECTABLE(Status, lowest, highest);
+    } status;
+
+    GR_MAKE_REFLECTABLE(ExtremeValueSource, out, settings, status);
 
     explicit ExtremeValueSource(gr::property_map init = {}) : gr::Block<ExtremeValueSource>(std::move(init)) {}
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        const auto n = std::min<std::size_t>(outSpan.size(), n_samples - produced_);
+        const auto n = std::min<std::size_t>(outSpan.size(), settings.n_samples - produced_);
         std::fill_n(outSpan.begin(), n, 0.0F);
         outSpan.publish(n);
         produced_ += static_cast<gr::Size_t>(n);
-        if (produced_ < n_samples) {
+        if (produced_ < settings.n_samples) {
             return gr::work::Status::OK;
         }
-        lowest = std::numeric_limits<std::int64_t>::min();
-        highest = std::numeric_limits<std::uint64_t>::max();
+        status.lowest = std::numeric_limits<std::int64_t>::min();
+        status.highest = std::numeric_limits<std::uint64_t>::max();
         return gr::work::Status::DONE;
     }
 
@@ -76,12 +94,17 @@ private:
 // exactly.
 struct WideIntegerSource : gr::Block<WideIntegerSource> {
     gr::PortOut<float> out;
-    std::int64_t offset = std::numeric_limits<std::int64_t>::min() + 1;
-    std::uint64_t limit = std::numeric_limits<std::uint64_t>::max() - 1U;
-    std::vector<std::int64_t> marks{std::numeric_limits<std::int64_t>::max() - 1, -1};
-    std::vector<std::uint64_t> strides{std::numeric_limits<std::uint64_t>::max() - 1U, 1U};
 
-    GR_MAKE_REFLECTABLE(WideIntegerSource, out, offset, limit, marks, strides);
+    struct Settings {
+        std::int64_t offset = std::numeric_limits<std::int64_t>::min() + 1;
+        std::uint64_t limit = std::numeric_limits<std::uint64_t>::max() - 1U;
+        std::vector<std::int64_t> marks{std::numeric_limits<std::int64_t>::max() - 1, -1};
+        std::vector<std::uint64_t> strides{std::numeric_limits<std::uint64_t>::max() - 1U, 1U};
+
+        GR_MAKE_REFLECTABLE(Settings, offset, limit, marks, strides);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(WideIntegerSource, out, settings);
 
     explicit WideIntegerSource(gr::property_map init = {}) : gr::Block<WideIntegerSource>(std::move(init)) {}
 
@@ -129,11 +152,16 @@ struct FailingSource : gr::Block<FailingSource> {
 // block. A stream binding writes `endpoint` and `transport`.
 struct StreamEndpointSink : gr::Block<StreamEndpointSink> {
     gr::PortIn<float> in;
-    std::string transport;
-    std::string payload_format;
-    std::string endpoint;
 
-    GR_MAKE_REFLECTABLE(StreamEndpointSink, in, transport, payload_format, endpoint);
+    struct Settings {
+        std::string transport;
+        std::string payload_format;
+        std::string endpoint;
+
+        GR_MAKE_REFLECTABLE(Settings, transport, payload_format, endpoint);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(StreamEndpointSink, in, settings);
 
     explicit StreamEndpointSink(gr::property_map init = {}) : gr::Block<StreamEndpointSink>(std::move(init)) {}
 
@@ -144,10 +172,15 @@ struct StreamEndpointSink : gr::Block<StreamEndpointSink> {
 // other stream key. Its `start()` keeps a copy of the block's meta_information.
 struct BoundStreamSink : gr::Block<BoundStreamSink> {
     gr::PortIn<float> in;
-    std::string transport;
-    std::string endpoint;
 
-    GR_MAKE_REFLECTABLE(BoundStreamSink, in, transport, endpoint);
+    struct Settings {
+        std::string transport;
+        std::string endpoint;
+
+        GR_MAKE_REFLECTABLE(Settings, transport, endpoint);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(BoundStreamSink, in, settings);
 
     explicit BoundStreamSink(gr::property_map init = {}) : gr::Block<BoundStreamSink>(std::move(init)) {}
 
@@ -230,9 +263,14 @@ private:
 // Produces `n_samples` zeros and ends. Its destructor enters the TeardownHold.
 struct HeldTeardownSource : gr::Block<HeldTeardownSource> {
     gr::PortOut<float> out;
-    gr::Size_t n_samples = 64U;
 
-    GR_MAKE_REFLECTABLE(HeldTeardownSource, out, n_samples);
+    struct Settings {
+        gr::Size_t n_samples = 64U;
+
+        GR_MAKE_REFLECTABLE(Settings, n_samples);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(HeldTeardownSource, out, settings);
 
     explicit HeldTeardownSource(gr::property_map init = {}) : gr::Block<HeldTeardownSource>(std::move(init)) {}
     HeldTeardownSource(const HeldTeardownSource&) = delete;
@@ -240,11 +278,11 @@ struct HeldTeardownSource : gr::Block<HeldTeardownSource> {
     ~HeldTeardownSource() { TeardownHold::enter(); }
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
-        const auto n = std::min<std::size_t>(outSpan.size(), n_samples - produced_);
+        const auto n = std::min<std::size_t>(outSpan.size(), settings.n_samples - produced_);
         std::fill_n(outSpan.begin(), n, 0.0F);
         outSpan.publish(n);
         produced_ += static_cast<gr::Size_t>(n);
-        return produced_ >= n_samples ? gr::work::Status::DONE : gr::work::Status::OK;
+        return produced_ >= settings.n_samples ? gr::work::Status::DONE : gr::work::Status::OK;
     }
 
 private:
@@ -268,25 +306,34 @@ private:
 // Writes its final receipts in stop(), then exposes no live block once the settings have been captured.
 struct TerminalSettingsSource : gr::Block<TerminalSettingsSource> {
     gr::PortOut<float> out;
-    gr::Size_t n_samples = 0U;  // zero runs until explicitly stopped
-    gr::property_map finalization;
-    std::string payload;
 
-    GR_MAKE_REFLECTABLE(TerminalSettingsSource, out, n_samples, finalization, payload);
+    struct Settings {
+        gr::Size_t n_samples = 0U;  // zero runs until explicitly stopped
+
+        GR_MAKE_REFLECTABLE(Settings, n_samples);
+    } settings;
+
+    struct Status {
+        gr::property_map finalization;
+        std::string payload;
+
+        GR_MAKE_REFLECTABLE(Status, finalization, payload);
+    } status;
+
+    GR_MAKE_REFLECTABLE(TerminalSettingsSource, out, settings, status);
     explicit TerminalSettingsSource(gr::property_map init = {}) : gr::Block<TerminalSettingsSource>(std::move(init)) {}
     static std::int64_t alive() noexcept { return LiveInstances::count(); }
     static std::size_t work_calls() noexcept { return work_calls_.load(std::memory_order_acquire); }
 
     void stop() {
-        finalization = {{"unique_name", std::string(this->unique_name)},
-                        {"unsigned", std::numeric_limits<std::uint64_t>::max()},
-                        {"signed", std::numeric_limits<std::int64_t>::min()}};
-        payload.assign(5 * 1024 * 1024, 'x');
-        // Publish the completed stop-hook receipt to the settings cache BlockHandle::get() reads.
-        this->settings().updateActiveParameters();
+        status.finalization = {{"unique_name", std::string(this->unique_name)},
+                               {"unsigned", std::numeric_limits<std::uint64_t>::max()},
+                               {"signed", std::numeric_limits<std::int64_t>::min()}};
+        status.payload.assign(5 * 1024 * 1024, 'x');
     }
 
     gr::work::Status processBulk(gr::OutputSpanLike auto& output) {
+        const auto n_samples = settings.n_samples;
         const auto n = n_samples == 0U ? output.size() : std::min<std::size_t>(output.size(), n_samples - produced_);
         std::fill_n(output.begin(), n, 0.0F);
         output.publish(n);
@@ -332,12 +379,17 @@ private:
 // `correction` (complex) and `taps` (complex list).
 struct VectorSettingsSource : gr::Block<VectorSettingsSource> {
     gr::PortOut<float> out;
-    std::vector<float> gains{1.0F, 2.0F};
-    std::vector<std::string> antennas{"RX", "TX"};
-    std::complex<float> correction{1.0F, -0.5F};
-    std::vector<std::complex<float>> taps{{1.0F, 0.0F}};
 
-    GR_MAKE_REFLECTABLE(VectorSettingsSource, out, gains, antennas, correction, taps);
+    struct Settings {
+        std::vector<float> gains{1.0F, 2.0F};
+        std::vector<std::string> antennas{"RX", "TX"};
+        std::complex<float> correction{1.0F, -0.5F};
+        std::vector<std::complex<float>> taps{{1.0F, 0.0F}};
+
+        GR_MAKE_REFLECTABLE(Settings, gains, antennas, correction, taps);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(VectorSettingsSource, out, settings);
 
     explicit VectorSettingsSource(gr::property_map init = {}) : gr::Block<VectorSettingsSource>(std::move(init)) {}
 
@@ -345,6 +397,186 @@ struct VectorSettingsSource : gr::Block<VectorSettingsSource> {
         std::ranges::fill(outSpan, 0.0F);
         outSpan.publish(outSpan.size());
         return gr::work::Status::OK;
+    }
+};
+
+// Produces zeros until the run stops, and holds `gain`, which its settings bound to [0, 1].
+struct LimitedSource : gr::Block<LimitedSource> {
+    gr::PortOut<float> out;
+
+    struct Settings {
+        gr::Annotated<float, gr::Limits<gr::Min<0.0F>, gr::Max<1.0F>>> gain = 0.5F;
+
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(LimitedSource, out, settings);
+
+    explicit LimitedSource(gr::property_map init = {}) : gr::Block<LimitedSource>(std::move(init)) {}
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::ranges::fill(outSpan, 0.0F);
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// Produces zeros until the run stops, and holds `gain`, which its start fails as a device lacking the setting would.
+struct GainlessSource : gr::Block<GainlessSource> {
+    gr::PortOut<float> out;
+
+    struct Settings {
+        float gain = 1.0F;
+
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(GainlessSource, out, settings);
+
+    explicit GainlessSource(gr::property_map init = {}) : gr::Block<GainlessSource>(std::move(init)) {}
+
+    void start() { this->fail("gain", "the source has no gain stage"); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::ranges::fill(outSpan, 0.0F);
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// Produces zeros until the run stops, and holds `gain`, whose declared default lies outside its bounds: core refuses
+// the start of a graph that gives the block no gain.
+struct UnboundedDefaultSource : gr::Block<UnboundedDefaultSource> {
+    gr::PortOut<float> out;
+
+    struct Settings {
+        gr::Annotated<float, gr::Limits<gr::Min<0.0F>, gr::Max<1.0F>>> gain = 2.0F;
+
+        GR_MAKE_REFLECTABLE(Settings, gain);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(UnboundedDefaultSource, out, settings);
+
+    explicit UnboundedDefaultSource(gr::property_map init = {}) : gr::Block<UnboundedDefaultSource>(std::move(init)) {}
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::ranges::fill(outSpan, 0.0F);
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// Produces zeros until the run stops, and holds `level`, whose check refuses a level above 1 with a refusal that names
+// no setting.
+struct KeylessRefusalSource : gr::Block<KeylessRefusalSource> {
+    gr::PortOut<float> out;
+
+    struct Settings {
+        float level = 0.5F;
+
+        GR_MAKE_REFLECTABLE(Settings, level);
+    } settings;
+
+    GR_MAKE_REFLECTABLE(KeylessRefusalSource, out, settings);
+
+    explicit KeylessRefusalSource(gr::property_map init = {}) : gr::Block<KeylessRefusalSource>(std::move(init)) {}
+
+    std::optional<gr::Refused> checkSettings(const Settings& s) const {
+        return s.level > 1.0F ? std::optional(gr::Refused("above the source's ceiling")) : std::nullopt;
+    }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::ranges::fill(outSpan, 0.0F);
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// Produces zeros. Its start throws, as a source with no device would, and the throw names no setting.
+struct DevicelessSource : gr::Block<DevicelessSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(DevicelessSource, out);
+
+    explicit DevicelessSource(gr::property_map init = {}) : gr::Block<DevicelessSource>(std::move(init)) {}
+
+    void start() { throw std::runtime_error("the source has no device"); }
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::ranges::fill(outSpan, 0.0F);
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// Produces zeros until the run stops, and declares its settings by a description instead of a struct: `level` with a
+// description, and `scale` with both a description and a documentation.
+struct DescribedSource : gr::Block<DescribedSource> {
+    gr::PortOut<float> out;
+
+    GR_MAKE_REFLECTABLE(DescribedSource, out);
+
+    gr::property_map describedSettings;
+
+    static gr::property_map settingsDescription() {
+        return gr::property_map{
+            {"version", 1},
+            {"block_type", "gr4cp::test::DescribedSource"},
+            {"settings",
+             gr::property_map{
+                 {"level", gr::property_map{{"type", "float32"}, {"default", 0.0F}, {"description", "output level"}}},
+                 {"scale",
+                  gr::property_map{{"type", "float32"},
+                                   {"default", 1.0F},
+                                   {"description", "output scale"},
+                                   {"documentation", "the factor applied to each output sample"}}}}},
+        };
+    }
+
+    explicit DescribedSource(gr::property_map init = {}) : gr::Block<DescribedSource>(std::move(init)) {}
+
+    gr::work::Status processBulk(gr::OutputSpanLike auto& outSpan) {
+        std::ranges::fill(outSpan, 0.0F);
+        outSpan.publish(outSpan.size());
+        return gr::work::Status::OK;
+    }
+};
+
+// A definitions directory, removed with the object, that holds one block definition: `gr4cp::test::UnboundedDefinition`
+// is a subgraph of one UnboundedDefaultSource named `inner`, which keeps its declared default. A plugin loader given
+// `path` builds the definition by its type.
+struct TestDefinitionRoot {
+    std::filesystem::path path = std::filesystem::temp_directory_path() /
+                                 ("gr4cp_test_definition_" + std::to_string(std::random_device{}()));
+
+    TestDefinitionRoot() {
+        std::filesystem::create_directories(path);
+        std::ofstream(path / "index.yaml") << R"(assets:
+  - file: unbounded_definition.yaml
+    created: "2024-01-01-00:00:00"
+    modified: "2024-01-01-00:00:00"
+    block_type: gr4cp::test::UnboundedDefinition
+)";
+        std::ofstream(path / "unbounded_definition.yaml") << R"(definition_metadata:
+  block_type: gr4cp::test::UnboundedDefinition
+blocks:
+  - id: SUBGRAPH
+    parameters:
+      name: unbounded_definition
+    graph:
+      blocks:
+        - id: "gr4cp::test::UnboundedDefaultSource"
+          parameters:
+            name: inner
+)";
+    }
+
+    TestDefinitionRoot(const TestDefinitionRoot&) = delete;
+    TestDefinitionRoot& operator=(const TestDefinitionRoot&) = delete;
+
+    ~TestDefinitionRoot() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
     }
 };
 
@@ -363,7 +595,13 @@ inline void register_test_blocks() {
                registry.insert<TerminalSettingsSink>("=gr4cp::test::TerminalSettingsSink") &&
                registry.insert<CountedSource>("=gr4cp::test::CountedSource") &&
                registry.insert<HeldTeardownSource>("=gr4cp::test::HeldTeardownSource") &&
-               registry.insert<VectorSettingsSource>("=gr4cp::test::VectorSettingsSource");
+               registry.insert<VectorSettingsSource>("=gr4cp::test::VectorSettingsSource") &&
+               registry.insert<LimitedSource>("=gr4cp::test::LimitedSource") &&
+               registry.insert<GainlessSource>("=gr4cp::test::GainlessSource") &&
+               registry.insert<UnboundedDefaultSource>("=gr4cp::test::UnboundedDefaultSource") &&
+               registry.insert<KeylessRefusalSource>("=gr4cp::test::KeylessRefusalSource") &&
+               registry.insert<DevicelessSource>("=gr4cp::test::DevicelessSource") &&
+               registry.insert<DescribedSource>("=gr4cp::test::DescribedSource");
     }();
     ASSERT_TRUE(registered);
 }

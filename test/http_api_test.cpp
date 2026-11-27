@@ -384,7 +384,7 @@ std::string compatibility_studio_http_poll_graph() {
       name: "src0"
       sample_rate: 1000.0
       chunk_size: 32
-      signal_type: "Sin"
+      signal_type: "sin"
       tone_frequency: 25.0
       amplitude: 1.0
       offset: 0.0
@@ -1611,10 +1611,205 @@ connections:
     EXPECT_EQ(final_settings["n_samples"], 64) << final_settings.dump();
 }
 
+// A server over a runtime that loads no plugin: its loader holds the test blocks and the test definition, and the
+// cases' graphs hold only those.
+class TestBlockHttpTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        gr4cp::test::register_test_blocks();
+        port = server.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(port, 0);
+        server_thread = std::jthread([this] { server.listen_after_bind(); });
+        client = std::make_unique<httplib::Client>("127.0.0.1", port);
+    }
+
+    void TearDown() override {
+        server.stop();
+        if (server_thread.joinable()) {
+            server_thread.join();
+        }
+    }
+
+    static nlohmann::json parse_json(const httplib::Result& response) {
+        EXPECT_TRUE(response);
+        return nlohmann::json::parse(response->body);
+    }
+
+    nlohmann::json create_session_with_graph(const std::string& grc) {
+        const auto response = client->Post("/sessions",
+                                           (R"({"name":"demo","grc":)" + nlohmann::json(grc).dump() + "}").c_str(),
+                                           "application/json");
+        EXPECT_TRUE(response);
+        EXPECT_EQ(response->status, 201);
+        return parse_json(response);
+    }
+
+    // Starts a new session of `grc` and returns its id and the answer's error message, after checking that the answer
+    // is 409 `settings_refused` and that the session reads `error` with that message. A request the server does not
+    // answer fails the case and returns an empty id and message.
+    std::pair<std::string, std::string> start_refused(const std::string& grc) {
+        const auto body = R"({"name":"refused","grc":)" + nlohmann::json(grc).dump() + "}";
+        const auto created = client->Post("/sessions", body, "application/json");
+        if (!created) {
+            ADD_FAILURE() << "the session was not created: " << httplib::to_string(created.error());
+            return {};
+        }
+        EXPECT_EQ(created->status, 201) << created->body;
+        const auto id = nlohmann::json::parse(created->body)["id"].get<std::string>();
+        const auto started = client->Post("/sessions/" + id + "/start", "", "application/json");
+        if (!started) {
+            ADD_FAILURE() << "the start was not answered: " << httplib::to_string(started.error());
+            return {id, {}};
+        }
+        EXPECT_EQ(started->status, 409) << started->body;
+        const auto error = nlohmann::json::parse(started->body)["error"];
+        EXPECT_EQ(error["code"], "settings_refused") << started->body;
+        const auto read = client->Get("/sessions/" + id);
+        if (!read) {
+            ADD_FAILURE() << "the session was not read: " << httplib::to_string(read.error());
+            return {id, {}};
+        }
+        const auto session = nlohmann::json::parse(read->body);
+        EXPECT_EQ(session["state"], "error") << read->body;
+        EXPECT_EQ(session["last_error"], error["message"]) << read->body;
+        return {id, error["message"].is_string() ? error["message"].get<std::string>() : std::string{}};
+    }
+
+    const gr4cp::test::TestDefinitionRoot definitions;
+    gr4cp::storage::InMemorySessionRepository repository;
+    gr4cp::runtime::Gr4RuntimeManager runtime_manager{std::make_shared<gr::PluginLoader>(
+        gr::globalBlockRegistry(), gr::globalSchedulerRegistry(), std::vector<std::string>{definitions.path.string()})};
+    TestBlockCatalogProvider block_catalog_provider;
+    TestSchedulerCatalogProvider scheduler_catalog_provider;
+    gr4cp::app::SessionService service{repository, runtime_manager};
+    gr4cp::app::SessionStreamService session_stream_service;
+    gr4cp::app::BlockSettingsService block_settings_service{service, runtime_manager};
+    gr4cp::app::BlockCatalogService block_catalog_service{block_catalog_provider};
+    gr4cp::app::SchedulerCatalogService scheduler_catalog_service{scheduler_catalog_provider};
+    gr4cp::api::HttpServer server{
+        service, session_stream_service, block_catalog_service, scheduler_catalog_service, block_settings_service};
+    int port = 0;
+    std::jthread server_thread;
+    std::unique_ptr<httplib::Client> client;
+};
+
+// A value outside a setting's range is answered with 400 and the block's refusal, which names the setting as
+// `<block>.<key>` and gives the range, and the setting keeps its value.
+TEST_F(TestBlockHttpTest, ValueOutsideTheRangeIsAnsweredWithTheSettingAndTheBlocksReason) {
+    const auto id = create_session_with_graph(R"(blocks:
+  - id: "gr4cp::test::LimitedSource"
+    parameters:
+      name: "lim0"
+  - id: "gr4cp::test::TerminalSettingsSink"
+    parameters:
+      name: "sink0"
+connections:
+  - ["lim0", 0, "sink0", 0]
+)")["id"].get<std::string>();
+    const auto started = client->Post("/sessions/" + id + "/start", "", "application/json");
+    ASSERT_TRUE(started);
+    ASSERT_EQ(started->status, 200) << started->body;
+
+    const auto path = "/sessions/" + id + "/blocks/lim0/settings";
+    const auto refused = client->Post(path, R"({"gain":2.0})", "application/json");
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(refused->status, 400) << refused->body;
+    EXPECT_EQ(nlohmann::json::parse(refused->body)["error"]["message"],
+              "block lim0 refused the settings: lim0.gain: out of range [0, 1]: 2")
+        << refused->body;
+
+    const auto read = client->Get(path);
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->status, 200) << read->body;
+    EXPECT_EQ(nlohmann::json::parse(read->body)["settings"]["gain"], 0.5) << read->body;
+
+    const auto stopped = client->Post("/sessions/" + id + "/stop", "", "application/json");
+    ASSERT_TRUE(stopped);
+    EXPECT_EQ(stopped->status, 200) << stopped->body;
+}
+
+// A start or a restart whose graph holds a value core refuses as it builds the graph is answered 409 with the code
+// `settings_refused` and each refused entry as core keys it: `<block>.<key>` for a block of the graph, and `<block>`
+// alone for a check's refusal that names no setting. The session reads the error. A graph that fails to build with no
+// refused entry, here for a type no plugin has, answers 500.
+TEST_F(TestBlockHttpTest, ValueRefusedAsTheGraphIsBuiltAnswers409WithEachEntry) {
+    const std::vector<std::pair<std::string, std::string>> refusals{
+        {R"(blocks:
+  - id: "gr4cp::test::LimitedSource"
+    parameters:
+      name: "lim0"
+      gain: 2.0
+)",
+         "lim0.gain: out of range [0, 1]: 2"},
+        {R"(blocks:
+  - id: "gr4cp::test::KeylessRefusalSource"
+    parameters:
+      name: "keyless0"
+      level: 2.0
+)",
+         "keyless0: above the source's ceiling"},
+    };
+    for (const auto& [grc, entries] : refusals) {
+        const auto id = create_session_with_graph(grc)["id"].get<std::string>();
+        for (const auto* action : {"start", "restart"}) {
+            const auto answered = client->Post("/sessions/" + id + "/" + action, "", "application/json");
+            ASSERT_TRUE(answered);
+            EXPECT_EQ(answered->status, 409) << action << ": " << answered->body;
+            const auto error = nlohmann::json::parse(answered->body)["error"];
+            EXPECT_EQ(error["code"], "settings_refused") << answered->body;
+            EXPECT_EQ(error["message"], std::format("runtime {} failed for session {}: session {} prepare failed: {}",
+                                                    action, id, id, entries))
+                << answered->body;
+
+            const auto read = client->Get("/sessions/" + id);
+            ASSERT_TRUE(read);
+            ASSERT_EQ(read->status, 200) << read->body;
+            const auto session = nlohmann::json::parse(read->body);
+            EXPECT_EQ(session["state"], "error") << read->body;
+            EXPECT_EQ(session["last_error"], error["message"]) << read->body;
+        }
+    }
+
+    const auto id =
+        create_session_with_graph("blocks:\n  - id: \"gr4cp::test::NoSuchBlock\"\n")["id"].get<std::string>();
+    const auto unknown = client->Post("/sessions/" + id + "/start", "", "application/json");
+    ASSERT_TRUE(unknown);
+    EXPECT_EQ(unknown->status, 500) << unknown->body;
+    EXPECT_EQ(nlohmann::json::parse(unknown->body)["error"]["code"], "runtime_error") << unknown->body;
+}
+
+// A start that core refuses for the declared default of a block inside a block definition is answered 409 with the key
+// as `<outer>.<inner>.<key>`, the path from the graph.
+TEST_F(TestBlockHttpTest, DefaultRefusedInsideADefinitionNamesThePathFromTheGraph) {
+    const auto [id, message] = start_refused(R"(blocks:
+  - id: "gr4cp::test::UnboundedDefinition"
+    parameters:
+      name: "unbounded0"
+)");
+    EXPECT_EQ(message, std::format("runtime start failed for session {}: session {} start failed: "
+                                   "unbounded0.inner.gain: default out of range [0, 1]: 2",
+                                   id, id));
+}
+
+// A start that core refuses for the declared defaults of two blocks that share a name is answered 409: each refused
+// entry names its block by its unique name, which the shared name does not match.
+TEST_F(TestBlockHttpTest, DefaultsRefusedForASharedNameAnswer409) {
+    const auto message = start_refused(R"(blocks:
+  - id: "gr4cp::test::UnboundedDefaultSource"
+    parameters:
+      name: "unbounded0"
+  - id: "gr4cp::test::UnboundedDefaultSource"
+    parameters:
+      name: "unbounded0"
+)").second;
+    EXPECT_EQ(message.find("unbounded0."), std::string::npos) << message;
+}
+
 // A patch writes back the decimal strings a read returned, then the values one past them, which no double holds. The
-// reads return each value exactly. The block reads the string as a decimal integer, ignoring surrounding whitespace and
-// a trailing `#` comment. A string it cannot read, or one outside the setting's range, is refused with 400 naming the
-// key, and the settings keep their values.
+// reads return each value exactly. The block reads the string as a decimal number, ignoring surrounding whitespace. A
+// string it cannot read, or one whose nearest double the setting's type cannot hold, is refused with 400 naming the
+// key, and the settings keep their values. A string one below the least signed value is accepted and reads back as the
+// least value.
 TEST_F(RealRuntimeHttpApiTest, SixtyFourBitSettingsTakeTheDecimalStringsTheyReadAs) {
     gr4cp::test::register_test_blocks();
     const auto id = create_session_with_graph(R"(blocks:
@@ -1671,7 +1866,6 @@ connections:
     const std::vector<std::pair<std::string, std::string>> refusals{
         {"limit", R"({"limit":"-1"})"},
         {"limit", R"({"limit":"18446744073709551616"})"},
-        {"offset", R"({"offset":"-9223372036854775809"})"},
         {"offset", R"({"offset":"12x"})"},
         {"offset", R"({"offset":""})"},
         {"marks", R"({"marks":["1","2.5"]})"},
@@ -1691,6 +1885,161 @@ connections:
     EXPECT_EQ(last["offset"], "-5") << last.dump();
     EXPECT_EQ(last["limit"], next["limit"]) << last.dump();
     EXPECT_EQ(last["marks"], next["marks"]) << last.dump();
+
+    // one below the least signed value reads as the double of that value, which the setting holds: the patch is
+    // accepted and the read returns the least value, not the one sent
+    const auto below = client->Post(path.c_str(), R"({"offset":"-9223372036854775809"})", "application/json");
+    ASSERT_TRUE(below);
+    ASSERT_EQ(below->status, 200) << below->body;
+    const auto least = read_settings_until("offset", "-9223372036854775808");
+    EXPECT_EQ(least["offset"], "-9223372036854775808") << least.dump();
+}
+
+// A start whose block fails a key at its start is answered 409 with the error of a start, which names the key as
+// `<block>.<key>` with the block's reason, and the session reads that error.
+TEST_F(TestBlockHttpTest, StartOfABlockThatFailsAKeyAnswersWithTheKeyAndTheBlocksReason) {
+    const auto id = create_session_with_graph(R"(blocks:
+  - id: "gr4cp::test::GainlessSource"
+    parameters:
+      name: "gainless0"
+      gain: 0.25
+  - id: "gr4cp::test::TerminalSettingsSink"
+    parameters:
+      name: "sink0"
+connections:
+  - ["gainless0", 0, "sink0", 0]
+)")["id"].get<std::string>();
+    const auto started = client->Post(("/sessions/" + id + "/start").c_str(), "", "application/json");
+    ASSERT_TRUE(started);
+    EXPECT_EQ(started->status, 409) << started->body;
+    EXPECT_EQ(parse_json(started)["error"]["code"], "settings_refused") << started->body;
+    const auto message = parse_json(started)["error"]["message"];
+    ASSERT_TRUE(message.is_string()) << started->body;
+    EXPECT_EQ(message, std::format("runtime start failed for session {}: session {} start failed: gainless0.gain: the "
+                                   "source has no gain stage",
+                                   id, id))
+        << started->body;
+
+    const auto read = client->Get(("/sessions/" + id).c_str());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->status, 200) << read->body;
+    const auto session = parse_json(read);
+    EXPECT_EQ(session["state"], "error") << session.dump();
+    ASSERT_TRUE(session["last_error"].is_string()) << session.dump();
+    EXPECT_EQ(session["last_error"], message) << session.dump();
+}
+
+// A start that core refuses for a block's setting as the graph starts, here a declared default outside the setting's
+// bounds that the graph does not replace, is answered 409 with the key as `<block>.<key>` and core's reason alone. The
+// scheduler's entry, which repeats the refusal by the block's unique name, is left out.
+TEST_F(TestBlockHttpTest, StartThatCoreRefusesForASettingAnswers409WithTheKey) {
+    const auto id = create_session_with_graph(R"(blocks:
+  - id: "gr4cp::test::UnboundedDefaultSource"
+    parameters:
+      name: "unbounded0"
+  - id: "gr4cp::test::TerminalSettingsSink"
+    parameters:
+      name: "sink0"
+connections:
+  - ["unbounded0", 0, "sink0", 0]
+)")["id"].get<std::string>();
+    const auto started = client->Post(("/sessions/" + id + "/start").c_str(), "", "application/json");
+    ASSERT_TRUE(started);
+    EXPECT_EQ(started->status, 409) << started->body;
+    EXPECT_EQ(parse_json(started)["error"]["code"], "settings_refused") << started->body;
+    const auto message = parse_json(started)["error"]["message"];
+    ASSERT_TRUE(message.is_string()) << started->body;
+    EXPECT_EQ(message, std::format("runtime start failed for session {}: session {} start failed: unbounded0.gain: "
+                                   "default out of range [0, 1]: 2",
+                                   id, id))
+        << started->body;
+}
+
+// A start that fails for a reason that names no setting, here a block whose start throws, is answered 500. Its text
+// names the block and the thrown reason.
+TEST_F(TestBlockHttpTest, StartOfABlockWhoseStartThrowsAnswers500) {
+    const auto id = create_session_with_graph(R"(blocks:
+  - id: "gr4cp::test::DevicelessSource"
+    parameters:
+      name: "deviceless0"
+  - id: "gr4cp::test::TerminalSettingsSink"
+    parameters:
+      name: "sink0"
+connections:
+  - ["deviceless0", 0, "sink0", 0]
+)")["id"].get<std::string>();
+    const auto started = client->Post(("/sessions/" + id + "/start").c_str(), "", "application/json");
+    ASSERT_TRUE(started);
+    EXPECT_EQ(started->status, 500) << started->body;
+    EXPECT_EQ(parse_json(started)["error"]["code"], "runtime_error") << started->body;
+    const auto text = parse_json(started)["error"]["message"].get<std::string>();
+    EXPECT_NE(text.find("deviceless0"), std::string::npos) << text;
+    EXPECT_NE(text.find("the source has no device"), std::string::npos) << text;
+
+    const auto read = client->Get(("/sessions/" + id).c_str());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->status, 200) << read->body;
+    EXPECT_EQ(parse_json(read)["state"], "error") << read->body;
+}
+
+// A start whose graph gives a block a parameter it does not declare is answered 409 with the entry `<block>.<key>`,
+// followed by core's message, which names the nearest declared keys.
+TEST_F(TestBlockHttpTest, UndeclaredParameterOfTheGraphAnswers409WithTheNearestKeys) {
+    const auto id = create_session_with_graph(R"(blocks:
+  - id: "gr4cp::test::LimitedSource"
+    parameters:
+      name: "lim0"
+      gian: 0.5
+)")["id"].get<std::string>();
+    const auto started = client->Post(("/sessions/" + id + "/start").c_str(), "", "application/json");
+    ASSERT_TRUE(started);
+    EXPECT_EQ(started->status, 409) << started->body;
+    EXPECT_EQ(parse_json(started)["error"]["code"], "settings_refused") << started->body;
+    const auto message = parse_json(started)["error"]["message"];
+    ASSERT_TRUE(message.is_string()) << started->body;
+    const auto text = message.get<std::string>();
+    EXPECT_TRUE(text.starts_with(std::format(
+        "runtime start failed for session {}: session {} prepare failed: lim0.gian: unknown setting (block 'lim0' of "
+        "type ",
+        id, id)))
+        << text;
+    EXPECT_NE(text.find("declares no setting named 'gian'; the nearest are 'gain'"), std::string::npos) << text;
+    EXPECT_TRUE(text.ends_with(")")) << text;
+}
+
+// A patch of a value the block reports but does not take is answered with 400 naming the key as read-only; a key the
+// block does not have is answered as unknown. Each names the key as `<block>.<key>`.
+TEST_F(TestBlockHttpTest, PatchOfAStatusValueIsAnsweredAsReadOnly) {
+    const auto id = create_session_with_graph(R"(blocks:
+  - id: "gr4cp::test::TerminalSettingsSource"
+    parameters:
+      name: "term0"
+  - id: "gr4cp::test::TerminalSettingsSink"
+    parameters:
+      name: "sink0"
+connections:
+  - ["term0", 0, "sink0", 0]
+)")["id"].get<std::string>();
+    const auto started = client->Post(("/sessions/" + id + "/start").c_str(), "", "application/json");
+    ASSERT_TRUE(started);
+    ASSERT_EQ(started->status, 200) << started->body;
+    const auto path = "/sessions/" + id + "/blocks/term0/settings";
+
+    const auto read_only = client->Post(path.c_str(), R"({"payload":"x"})", "application/json");
+    ASSERT_TRUE(read_only);
+    EXPECT_EQ(read_only->status, 400) << read_only->body;
+    EXPECT_EQ(parse_json(read_only)["error"]["message"], "block term0 holds term0.payload read-only")
+        << read_only->body;
+
+    const auto unknown = client->Post(path.c_str(), R"({"no_such_key":1})", "application/json");
+    ASSERT_TRUE(unknown);
+    EXPECT_EQ(unknown->status, 400) << unknown->body;
+    EXPECT_EQ(parse_json(unknown)["error"]["message"], "block term0 has no setting named term0.no_such_key")
+        << unknown->body;
+
+    const auto stopped = client->Post(("/sessions/" + id + "/stop").c_str(), "", "application/json");
+    ASSERT_TRUE(stopped);
+    EXPECT_EQ(stopped->status, 200) << stopped->body;
 }
 
 // A patch takes the two ends of the signed 64-bit range as JSON numbers, alone and in a list, and the reads return each
@@ -1893,7 +2242,7 @@ TEST_F(RealRuntimeHttpApiTest, DeletedSessionsReturnTheirThreadsAndMemory) {
       name: gen
       sample_rate: !!float32 48000.0
       chunk_size: !!uint32 480
-      signal_type: Sin
+      signal_type: sin
       tone_frequency: !!float32 1000.0
       amplitude: !!float32 1.0
   - id: gr::blocks::math::MultiplyConst<float32>

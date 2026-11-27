@@ -30,4 +30,17 @@ TEST(FinalSettingsTest, CaptureFailureRemainsAReadErrorWithoutHidingOtherBlocks)
     }
     EXPECT_EQ(captured.at("healthy").get().at("value").value_or(0), 42);
 }
+
+// A refused read of a block's values throws core's text with each entry keyed by the block, `<block>.<key>`, and the
+// block alone for an entry that names no key.
+TEST(FinalSettingsTest, RefusedReadNamesEachEntryByItsBlock) {
+    const std::expected<gr::settings::Values, gr::settings::Rejected> refused = std::unexpected(gr::settings::Rejected{
+        {.key = "gain", .reason = "out of range [0, 1]: 2"}, {.key = "", .reason = "the block is gone"}});
+    try {
+        (void)gr4cp::runtime::detail::values_in_force(refused, "lim0");
+        FAIL() << "a refused read must not read as values";
+    } catch (const std::runtime_error& error) {
+        EXPECT_EQ(std::string(error.what()), "lim0.gain: out of range [0, 1]: 2; lim0: the block is gone");
+    }
+}
 }  // namespace

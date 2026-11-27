@@ -287,6 +287,8 @@ ErrorDetails current_error_details() {
         return {404, "not_found", error.what()};
     } catch (const app::InvalidStateError& error) {
         return {409, "invalid_state", error.what()};
+    } catch (const app::StartSettingsError& error) {
+        return {409, "settings_refused", error.what()};
     } catch (const app::RuntimeError& error) {
         return {500, "runtime_error", error.what()};
     } catch (const catalog::SchedulerCatalogLoadError& error) {

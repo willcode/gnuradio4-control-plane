@@ -183,7 +183,7 @@ std::string continuous_graph_yaml() {
       name: "src0"
       sample_rate: 1000.0
       chunk_size: 32
-      signal_type: "Sin"
+      signal_type: "sin"
       tone_frequency: 25.0
       amplitude: 1.0
       offset: 0.0
@@ -249,7 +249,7 @@ std::string compatibility_studio_http_series_graph_yaml() {
       name: "src0"
       sample_rate: 1000.0
       chunk_size: 32
-      signal_type: "Sin"
+      signal_type: "sin"
       tone_frequency: 25.0
       amplitude: 1.0
       offset: 0.0
@@ -275,7 +275,7 @@ std::string compatibility_studio_http_waterfall_graph_yaml() {
       name: "src0"
       sample_rate: 1000.0
       chunk_size: 32
-      signal_type: "Sin"
+      signal_type: "sin"
       tone_frequency: 25.0
       amplitude: 1.0
       offset: 0.0
@@ -382,6 +382,24 @@ TEST_F(Gr4RuntimeManagerTest, LegacyMinimalGraphShapeIsNormalizedBeforePrepare) 
     EXPECT_NO_THROW(runtime_.destroy(session));
 }
 
+// A block entry that gives its name at block level, beside its type, loads under that name.
+TEST_F(Gr4RuntimeManagerTest, BlockLevelNameOfAnEntryNamesTheBlock) {
+    auto session = make_session("runtime_block_level_name", R"(blocks:
+  - block: "gr::blocks::basic::NullSource<float32>"
+    name: "src0"
+  - block: "gr::blocks::basic::NullSink<float32>"
+    name: "sink0"
+connections:
+  - ["src0", 0, "sink0", 0]
+)");
+
+    ASSERT_NO_THROW(runtime_.prepare(session));
+    ASSERT_NO_THROW(runtime_.start(session));
+    EXPECT_NO_THROW((void)runtime_.get_block_settings(session, "src0"));
+    EXPECT_NO_THROW(runtime_.stop(session));
+    EXPECT_NO_THROW(runtime_.destroy(session));
+}
+
 TEST_F(Gr4RuntimeManagerTest, CompatibilityStudioInlineGraphShapeIsNormalizedBeforePrepare) {
     auto session = make_session("runtime_studio_graph", studio_inline_graph_yaml());
 
@@ -430,7 +448,7 @@ TEST_F(Gr4RuntimeManagerTest, CompatibilityStudioBlockNameResolvesForSettingsRou
       name: "gr__basic__SignalGenerator_float32__1"
       sample_rate: 1000.0
       chunk_size: 32
-      signal_type: "Sin"
+      signal_type: "sin"
       tone_frequency: 25.0
       amplitude: 1.0
       offset: 0.0
@@ -761,6 +779,24 @@ TEST_F(Gr4RuntimeManagerTest, NoStagingDirectoryIsCreated) {
     }
     EXPECT_TRUE(std::filesystem::is_empty(temporary));
     std::filesystem::remove_all(temporary);
+}
+
+// A setting declared by a description has no Doc; the catalog gives its documentation as the summary, else its
+// description.
+TEST_F(Gr4RuntimeManagerTest, CatalogSummaryOfADescribedSettingIsItsDescription) {
+    gr4cp::test::register_test_blocks();
+    const auto blocks = gr4cp::catalog::Gr4BlockCatalogProvider(gr4cp::test::plugin_loader()).list();
+    const auto block =
+        std::ranges::find(blocks, std::string("gr4cp::test::DescribedSource"), &gr4cp::domain::BlockDescriptor::id);
+    ASSERT_NE(block, blocks.end());
+    const auto level =
+        std::ranges::find(block->parameters, std::string("level"), &gr4cp::domain::BlockParameterDescriptor::name);
+    ASSERT_NE(level, block->parameters.end());
+    EXPECT_EQ(level->summary, "output level");
+    const auto scale =
+        std::ranges::find(block->parameters, std::string("scale"), &gr4cp::domain::BlockParameterDescriptor::name);
+    ASSERT_NE(scale, block->parameters.end());
+    EXPECT_EQ(scale->summary, "the factor applied to each output sample");
 }
 
 TEST_F(Gr4RuntimeManagerTest, FiniteGraphReadsStoppedAfterItEnds) {
@@ -1239,9 +1275,9 @@ connections:
 }
 
 TEST_F(Gr4RuntimeManagerTest, SchedulerAliasesResolveToCoreSchedulers) {
-    EXPECT_EQ(gr4cp::runtime::core_scheduler_type("gr::scheduler::SimpleSingle"), "gr::scheduler::Simple<singleThreaded>");
-    EXPECT_EQ(gr4cp::runtime::core_scheduler_type("gr::scheduler::SimpleMulti"), "gr::scheduler::Simple<multiThreaded>");
-    EXPECT_EQ(gr4cp::runtime::core_scheduler_type("gr::scheduler::Simple<multiThreaded>"), "gr::scheduler::Simple<multiThreaded>");
+    EXPECT_EQ(gr4cp::runtime::core_scheduler_type("gr::scheduler::SimpleSingle"), "gr::scheduler::Simple<single_threaded>");
+    EXPECT_EQ(gr4cp::runtime::core_scheduler_type("gr::scheduler::SimpleMulti"), "gr::scheduler::Simple<multi_threaded>");
+    EXPECT_EQ(gr4cp::runtime::core_scheduler_type("gr::scheduler::Simple<multi_threaded>"), "gr::scheduler::Simple<multi_threaded>");
 
     const auto loader = gr4cp::test::plugin_loader();
     const auto available = loader->availableSchedulers();

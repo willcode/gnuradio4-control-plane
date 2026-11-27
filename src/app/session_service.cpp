@@ -143,6 +143,10 @@ domain::Session SessionService::start(const std::string& id) {
     try {
         runtime_manager_.prepare(session);
         runtime_manager_.start(session);
+    } catch (const runtime::StartSettingsError& error) {
+        const auto message = runtime_message("start", id, error);
+        record_failure(std::move(session), message, std::nullopt);
+        throw StartSettingsError(message);
     } catch (const std::exception& error) {
         record_runtime_failure(std::move(session), runtime_message("start", id, error), std::nullopt);
     } catch (...) {
@@ -237,6 +241,10 @@ domain::Session SessionService::restart(const std::string& id) {
         runtime_manager_.destroy(session);
         runtime_manager_.prepare(session);
         runtime_manager_.start(session);
+    } catch (const runtime::StartSettingsError& error) {
+        const auto message = runtime_message("restart", id, error);
+        record_failure(std::move(session), message, std::nullopt);
+        throw StartSettingsError(message);
     } catch (const std::exception& error) {
         record_runtime_failure(std::move(session), runtime_message("restart", id, error), std::nullopt);
     } catch (...) {
@@ -431,6 +439,14 @@ domain::Session SessionService::load_or_throw(const std::string& id) {
                                                          const std::string& message,
                                                          std::optional<domain::CompletionReason> reason,
                                                          const InternalLifecyclePhase phase) {
+    record_failure(std::move(session), message, reason, phase);
+    throw RuntimeError(message);
+}
+
+void SessionService::record_failure(domain::Session session,
+                                    const std::string& message,
+                                    std::optional<domain::CompletionReason> reason,
+                                    const InternalLifecyclePhase phase) {
     std::lock_guard lock(mutex_);
     session = load_or_throw(session.id);
     session.state = domain::SessionState::Error;
@@ -441,7 +457,6 @@ domain::Session SessionService::load_or_throw(const std::string& id) {
     }
     session.updated_at = now_utc();
     store_session_locked(session, phase);
-    throw RuntimeError(message);
 }
 
 void SessionService::store_session_locked(const domain::Session& session, const InternalLifecyclePhase phase) {

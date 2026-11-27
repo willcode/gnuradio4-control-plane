@@ -273,6 +273,8 @@ WasmResponse current_error_response() {
         return error_response(404, "not_found", error.what());
     } catch (const app::InvalidStateError& error) {
         return error_response(409, "invalid_state", error.what());
+    } catch (const app::StartSettingsError& error) {
+        return error_response(409, "settings_refused", error.what());
     } catch (const app::RuntimeError& error) {
         return error_response(500, "runtime_error", error.what());
     } catch (const catalog::SchedulerCatalogLoadError& error) {

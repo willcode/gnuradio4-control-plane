@@ -257,13 +257,14 @@ std::optional<std::string> parameter_ui_hint(std::string_view name) {
 }
 
 std::string parameter_summary(const gr::property_map& meta, std::string_view name) {
-    if (const auto description = parameter_meta_string(meta, name, "::description");
-        description.has_value() && !description->empty()) {
-        return *description;
-    }
     if (const auto documentation = parameter_meta_string(meta, name, "::documentation");
         documentation.has_value() && !documentation->empty()) {
         return *documentation;
+    }
+    // a setting a block declares by description carries its summary here
+    if (const auto description = parameter_meta_string(meta, name, "::description");
+        description.has_value() && !description->empty()) {
+        return *description;
     }
     return "";
 }
@@ -559,9 +560,8 @@ std::vector<domain::BlockPortDescriptor> to_ports(gr::BlockModel::DynamicPorts& 
 
 std::vector<domain::BlockParameterDescriptor> to_parameters(gr::BlockModel& block) {
     std::vector<domain::BlockParameterDescriptor> descriptors;
-    (void)block.settings().applyStagedParameters();
-    const auto settings = block.settings().get();
-    const auto  writable         = block.settings().writableMembers();
+    const auto settings = gr::settings::heldValues(block.get());
+    const auto  writable         = block.writableMembers();
     const auto& meta_information = block.metaInformation();
     descriptors.reserve(settings.size());
     for (const auto& [name, value] : settings) {
@@ -599,7 +599,8 @@ domain::BlockDescriptor reflect_block(gr::PluginLoader& loader, const std::strin
         throw CatalogLoadError("failed to instantiate GNU Radio 4 block for catalog: " + id);
     }
 
-    block->settings().init();
+    // An empty check initializes the settings, which writes the metadata the catalog reads.
+    (void)block->check({});
     auto parameters = to_parameters(*block);
     const auto summary = block_summary(*block);
     return {

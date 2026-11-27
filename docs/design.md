@@ -63,6 +63,7 @@ Lifecycle rules:
 - `start`, `stop`, `restart` and `remove` read the run first. A run that ended by itself is recorded before the action.
 - every read of a running session observes its run. The last error a block reported becomes `last_error`. A run that ended by itself moves the session to `stopped`, or to `error` with the run's error. The ended run is destroyed after the service releases its lock.
 - runtime failures are recorded on the session as `error` with `last_error`, then surfaced as application errors.
+- a `start` or `restart` that stops on a setting, a value or an undeclared parameter that core refuses while it builds the graph, one that it refuses as the graph starts or one that a block fails at its start, is a start-settings error, answered 409 with the error code `settings_refused` and each such key as `<block>.<key>` with its reason. An entry that names no key, such as a block's check that refuses the graph's values as a whole, reads `<block>: <reason>`. For an undeclared parameter, core's message follows the entries in parentheses and names the nearest declared keys. No run is left. A start refusal that names no setting and every other failed start or restart are runtime errors, answered 500.
 
 Business rules belong in `SessionService` or the specific application service responsible for the feature. They do not belong in route handlers or the CLI.
 
@@ -183,7 +184,7 @@ Supported JSON value shapes are:
 - an object with exactly the two numbers `real` and `imag`, a complex value
 - nested object
 
-A read returns a list setting as an array and a complex value as the object of `real` and `imag`. A 64-bit integer, signed or unsigned, reads as its decimal string, in a running session and after its run has ended. A smaller integer reads as a number. A patch takes a 64-bit setting, or an element of a list of them, as its decimal string or as a number. A client sends an unsigned value above the signed 64-bit range as its decimal string. The block reads the string as a decimal integer, ignoring surrounding whitespace and a trailing `#` comment. A string it cannot read, or one outside the setting's range, is refused with 400 naming the key.
+A read returns a list setting as an array and a complex value as the object of `real` and `imag`. A 64-bit integer, signed or unsigned, reads as its decimal string, in a running session and after its run has ended. A smaller integer reads as a number. A patch takes a 64-bit setting, or an element of a list of them, as its decimal string or as a number. A client sends an unsigned value above the signed 64-bit range as its decimal string. The block reads the string as a decimal number, ignoring surrounding whitespace. A string it cannot read, or one whose nearest double the setting's type cannot hold, is refused with 400 naming the key. A string one below the least signed 64-bit value is taken as the least value.
 
 ## Stream Metadata
 
@@ -226,7 +227,7 @@ Do not introduce public stream, websocket, SSE, diagnostics, or history surfaces
 
 ## Error Handling
 
-Application services raise typed errors for validation, not-found, invalid-state, runtime, catalog, and scheduler-catalog failures. The HTTP layer maps those errors into stable JSON error responses.
+Application services raise typed errors for validation, not-found, invalid-state, runtime, start-settings, catalog, and scheduler-catalog failures. The HTTP layer maps those errors into stable JSON error responses.
 
 Route handlers should not inspect exception internals beyond this mapping. Application services should provide messages that are useful to operators while preserving the narrow API contract.
 

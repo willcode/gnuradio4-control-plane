@@ -59,8 +59,8 @@ std::runtime_error runtime_error(const domain::Session& session, std::string_vie
 }
 
 constexpr std::array<SchedulerAlias, 2> kSchedulerAliases{{
-    {"gr::scheduler::SimpleSingle", "gr::scheduler::Simple<singleThreaded>"},
-    {"gr::scheduler::SimpleMulti", "gr::scheduler::Simple<multiThreaded>"},
+    {"gr::scheduler::SimpleSingle", "gr::scheduler::Simple<single_threaded>"},
+    {"gr::scheduler::SimpleMulti", "gr::scheduler::Simple<multi_threaded>"},
 }};
 
 // Creates the core scheduler type the alias at `Index` names.
@@ -97,7 +97,7 @@ using detail::CapturedBlock;
 template <typename Block>
 std::optional<std::string> settings_name(const Block& block) {
     const auto value = block.get(std::string("name"));
-    return value.has_value() ? value_as_string(*value) : std::nullopt;
+    return value.has_value() ? value_as_string(value->value) : std::nullopt;
 }
 
 template <typename Block>
@@ -173,7 +173,8 @@ Block* resolve_runtime_block(std::map<std::string, Block, std::less<>>& blocks,
 // Converts a double-precision complex patch value to single precision when the block holds a single-precision complex
 // value, and each such element of a list when the block holds a list of them. The framework converts neither complex
 // precision to the other.
-gr::pmt::Value with_held_complex_precision(const gr::pmt::Value& value, const std::optional<gr::pmt::Value>& held) {
+gr::pmt::Value with_held_complex_precision(const gr::pmt::Value& value,
+                                          const std::expected<gr::settings::Value, gr::settings::Rejected>& held) {
     if (!held.has_value()) {
         return value;
     }
@@ -183,11 +184,11 @@ gr::pmt::Value with_held_complex_precision(const gr::pmt::Value& value, const st
         }
         return item;
     };
-    if (held->get_if<std::complex<float>>() != nullptr) {
+    if (held->value.get_if<std::complex<float>>() != nullptr) {
         return narrowed(value);
     }
     const auto* elements = value.get_if<gr::Tensor<gr::pmt::Value>>();
-    if (held->get_if<gr::Tensor<std::complex<float>>>() == nullptr || elements == nullptr) {
+    if (held->value.get_if<gr::Tensor<std::complex<float>>>() == nullptr || elements == nullptr) {
         return value;
     }
     gr::Tensor<gr::pmt::Value> result;
@@ -495,6 +496,47 @@ struct HeapRelease {
     }
 };
 
+// Returns true when `key` reads `<name>.<setting>` for a setting the block declares, where `<name>` ends in the block's
+// name or unique name: a block inside a subgraph is named after the blocks that hold it, `<outer>.<inner>`.
+bool names_a_setting_of(std::string_view key, const gr::BlockHandle& block) {
+    const auto declared = block.writableMembers();
+    for (const auto& name : {block.name(), block.uniqueName()}) {
+        if (name.empty()) {
+            continue;
+        }
+        for (auto at = key.find(name); at != std::string_view::npos; at = key.find(name, at + 1)) {
+            const auto end = at + name.size();
+            if ((at == 0 || key[at - 1] == '.') && end + 1 < key.size() && key[end] == '.' &&
+                declared.contains(std::string(key.substr(end + 1)))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Returns true when core's refusal of a start names a setting of one of `blocks`: the entry's key is the name the graph
+// gives the block, a dot and the setting's key. An entry keyed by the block alone names no setting: a start hook's
+// throw, or a check's refusal that names none. The scheduler's entry names the scheduler.
+bool refuses_a_setting(const gr::settings::Rejected& refused,
+                       const std::map<std::string, gr::BlockHandle, std::less<>>& blocks) {
+    return std::ranges::any_of(refused, [&blocks](const gr::settings::Rejection& entry) {
+        return std::ranges::any_of(
+            blocks, [&entry](const auto& block) { return names_a_setting_of(entry.key, block.second); });
+    });
+}
+
+// Returns the entries of core's refusal of a graph, followed by core's message in parentheses when the message says
+// more than the entries' reasons: for a parameter the block does not declare, it names the block's type and the
+// nearest declared keys.
+std::string describe_graph_refusal(const gr::RuntimeError& error) {
+    const auto entries = gr::settings::describeRejected(error.rejected);
+    const bool restates = std::ranges::all_of(error.rejected, [&error](const gr::settings::Rejection& entry) {
+        return error.message.find(entry.reason) != std::string::npos;
+    });
+    return restates || error.message.empty() ? entries : std::format("{} ({})", entries, error.message);
+}
+
 }  // namespace
 
 struct Gr4RuntimeManager::Execution {
@@ -578,13 +620,32 @@ void Gr4RuntimeManager::start(const domain::Session& session) {
     resources->teardown_error.reset();
     resources->teardown_complete = false;
     resources->lifecycle_phase = LifecyclePhase::Starting;
-    if (const auto started = execution.runtime->start(); !started.has_value()) {
+    const auto started = execution.runtime->start();
+    if (!started.has_value()) {
         resources->lifecycle_phase = LifecyclePhase::Idle;
         resources->teardown_complete = true;
-        throw runtime_error(session, "start", started.error().message);
+        if (refuses_a_setting(started.error(), execution.blocks)) {
+            // the scheduler's entry repeats the blocks' refusals in its own text, which names each block by its unique
+            // name
+            auto refused = started.error();
+            const auto scheduler = execution.runtime->scheduler();
+            std::erase_if(refused, [&scheduler](const gr::settings::Rejection& entry) {
+                return entry.key == scheduler.name() || entry.key == scheduler.uniqueName();
+            });
+            throw StartSettingsError(runtime_error(session, "start", gr::settings::describeRejected(refused)).what());
+        }
+        throw runtime_error(session, "start", gr::settings::describeRejected(started.error()));
     }
     execution.running = true;
     resources->lifecycle_phase = LifecyclePhase::Running;
+    // The graph runs on when a block fails a key at its start. The start ends that run and reports each such key.
+    if (const auto failed = detail::failed_keys(*started); !failed.empty()) {
+        try {
+            std::ignore = stop_locked(session, *resources, resource_lock);
+        } catch (...) {
+        }
+        throw StartSettingsError(runtime_error(session, "start", gr::settings::describeRejected(failed)).what());
+    }
 }
 
 std::optional<std::string> Gr4RuntimeManager::stop(const domain::Session& session) {
@@ -720,22 +781,40 @@ void Gr4RuntimeManager::set_block_settings(const domain::Session& session,
     if (block == nullptr) {
         throw make_block_not_found_error(run->execution.blocks, block_target);
     }
+    // a key a read returns but no call may set, such as a Status value, is read-only; a key no read returns is unknown.
+    // Each answer names a key as `<block>.<key>`.
+    const auto entry = detail::entry_name(*block);
     const auto accepted = block->writableMembers();
+    std::optional<std::expected<gr::settings::Values, gr::settings::Rejected>> readable;
     std::string foreign;
+    std::string read_only;
     for (const auto& [key, _] : patch) {
-        if (!accepted.contains(std::string(key))) {
-            foreign += foreign.empty() ? std::string(key) : ", " + std::string(key);
+        const std::string name(key);
+        if (accepted.contains(name)) {
+            continue;
         }
+        if (!readable.has_value()) {
+            readable = block->get();
+        }
+        auto& names = readable->has_value() && (*readable)->contains(name) ? read_only : foreign;
+        names += std::format("{}{}.{}", names.empty() ? "" : ", ", entry, name);
     }
     if (!foreign.empty()) {
         throw SettingsRefusedError(std::format("block {} has no setting named {}", block_target, foreign));
+    }
+    if (!read_only.empty()) {
+        throw SettingsRefusedError(std::format("block {} holds {} read-only", block_target, read_only));
     }
     gr::property_map converted;
     for (const auto& [key, value] : patch) {
         converted.insert_or_assign(key, with_held_complex_precision(value, block->get(std::string(key))));
     }
-    if (const auto staged = block->setStaged(converted); !staged.has_value()) {
-        throw SettingsRefusedError(std::format("block {} refused the settings: {}", block_target, staged.error().message));
+    // a key that applies at the call and fails there is refused as a key the call refuses
+    const auto staged = block->set(converted, gr::settings::noWait);
+    if (const auto refused = staged.has_value() ? detail::failed_keys(*staged) : staged.error(); !refused.empty()) {
+        throw SettingsRefusedError(
+            std::format("block {} refused the settings: {}", block_target,
+                        gr::settings::describeRejected(detail::keyed_by_block(refused, entry))));
     }
 }
 
@@ -772,7 +851,7 @@ gr::property_map Gr4RuntimeManager::get_block_settings(const domain::Session& se
     if (block == nullptr) {
         throw make_block_not_found_error(source->blocks, block_target);
     }
-    return block->get();
+    return detail::values_in_force(block->get(), detail::entry_name(*block));
 }
 
 RunObservation Gr4RuntimeManager::observe(const domain::Session& session) {
@@ -906,6 +985,7 @@ Gr4RuntimeManager::Execution& Gr4RuntimeManager::prepare_locked(const domain::Se
     }
 
     auto execution = std::make_unique<Execution>();
+    bool refused_a_setting = false;  // core refused a value of the graph's blocks as it built them
     try {
         std::map<std::string, gr::property_map, std::less<>> overrides;
         for (const auto& binding : stream_bindings) {
@@ -916,7 +996,9 @@ Gr4RuntimeManager::Execution& Gr4RuntimeManager::prepare_locked(const domain::Se
         }
         auto graph = gr::RuntimeGraph::fromYaml(loader_, normalize_graph_content(session.grc_content, stream_bindings), overrides);
         if (!graph.has_value()) {
-            throw std::runtime_error(graph.error().message);
+            const auto& refused = graph.error().rejected;
+            refused_a_setting = !refused.empty();
+            throw std::runtime_error(refused_a_setting ? describe_graph_refusal(graph.error()) : graph.error().message);
         }
         for (auto& block : graph->blocks(gr::RuntimeGraph::Recursive::Yes)) {
             execution->blocks.emplace(std::string(block.uniqueName()), block);
@@ -933,7 +1015,11 @@ Gr4RuntimeManager::Execution& Gr4RuntimeManager::prepare_locked(const domain::Se
         for (const auto& binding : stream_bindings) {
             stream_allocator_.release(binding.internal);
         }
-        throw runtime_error(session, "prepare", error.what());
+        const auto failure = runtime_error(session, "prepare", error.what());
+        if (refused_a_setting) {
+            throw StartSettingsError(failure.what());
+        }
+        throw failure;
     }
 
     resources.execution = std::move(execution);
